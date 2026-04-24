@@ -282,7 +282,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
                     reasoning_details: Map.get(turn, :reasoning_details),
                     tool_calls: turn.tool_calls,
                     usage: turn.usage,
-                    finish_reason: turn.finish_reason
+                    finish_reason: turn.finish_reason,
+                    logprobs: turn.logprobs
                   },
                   llm_call_id: call_id
                 )
@@ -450,8 +451,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
            stream_process_opts(owner, ref, trace_cfg, state_key, heartbeat_interval_ms)
          ) do
       {:ok, response} ->
-        {:ok, current_stream_state(state_key, state),
-         Turn.from_response(response, model: Jido.AI.model_label(config.model)), extract_response_id(response)}
+        turn = Turn.from_response(response, model: Jido.AI.model_label(config.model))
+        {:ok, current_stream_state(state_key, state), turn, extract_response_id(response)}
 
       {:error, reason} ->
         {:error, current_stream_state(state_key, state), reason}

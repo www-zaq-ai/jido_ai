@@ -49,7 +49,8 @@ defmodule Jido.AI.Turn do
           model: String.t() | nil,
           finish_reason: atom() | nil,
           message_metadata: map(),
-          tool_results: list(tool_result())
+          tool_results: list(tool_result()),
+          logprobs: list(map()) | nil
         }
 
   defstruct type: :final_answer,
@@ -61,7 +62,8 @@ defmodule Jido.AI.Turn do
             model: nil,
             finish_reason: nil,
             message_metadata: %{},
-            tool_results: []
+            tool_results: [],
+            logprobs: nil
 
   @doc """
   Builds a turn from a ReqLLM response.
@@ -93,7 +95,8 @@ defmodule Jido.AI.Turn do
       model: Keyword.get(opts, :model, response.model),
       finish_reason: normalize_finish_reason(classified.finish_reason),
       message_metadata: normalize_metadata(response.message.metadata),
-      tool_results: []
+      tool_results: [],
+      logprobs: get_in(response.provider_meta, [:logprobs])
     }
   end
 
@@ -113,7 +116,8 @@ defmodule Jido.AI.Turn do
       model: Keyword.get(opts, :model, get_field(response, :model)),
       finish_reason: finish_reason,
       message_metadata: normalize_metadata(get_field(message, :metadata)),
-      tool_results: []
+      tool_results: [],
+      logprobs: get_in(get_field(response, :provider_meta, %{}) || %{}, [:logprobs])
     }
   end
 
