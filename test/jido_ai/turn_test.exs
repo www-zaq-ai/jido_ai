@@ -219,6 +219,49 @@ defmodule Jido.AI.TurnTest do
       assert turn.type == :final_answer
       assert turn.finish_reason == nil
     end
+
+    test "extracts logprobs from provider_meta in ReqLLM.Response" do
+      logprobs = [
+        %{"token" => "Hello", "logprob" => -0.5, "top_logprobs" => []},
+        %{"token" => " world", "logprob" => -0.2, "top_logprobs" => []}
+      ]
+
+      response = %ReqLLM.Response{
+        id: "resp_logprobs",
+        model: "openai:gpt-4o",
+        context: ReqLLM.Context.new(),
+        message: ReqLLM.Context.assistant("Hello world", metadata: %{}),
+        stream?: false,
+        stream: nil,
+        usage: %{"input_tokens" => "5", "output_tokens" => "2"},
+        finish_reason: :stop,
+        provider_meta: %{logprobs: logprobs},
+        error: nil
+      }
+
+      turn = Turn.from_response(response)
+
+      assert turn.logprobs == logprobs
+    end
+
+    test "logprobs is nil when not present in provider_meta" do
+      response = %ReqLLM.Response{
+        id: "resp_no_logprobs",
+        model: "openai:gpt-4o",
+        context: ReqLLM.Context.new(),
+        message: ReqLLM.Context.assistant("Hello", metadata: %{}),
+        stream?: false,
+        stream: nil,
+        usage: %{"input_tokens" => "3", "output_tokens" => "1"},
+        finish_reason: :stop,
+        provider_meta: %{},
+        error: nil
+      }
+
+      turn = Turn.from_response(response)
+
+      assert turn.logprobs == nil
+    end
   end
 
   describe "message projections" do

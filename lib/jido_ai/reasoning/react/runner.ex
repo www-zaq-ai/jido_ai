@@ -286,7 +286,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
                     reasoning_details: Map.get(turn, :reasoning_details),
                     tool_calls: turn.tool_calls,
                     usage: turn.usage,
-                    finish_reason: turn.finish_reason
+                    finish_reason: turn.finish_reason,
+                    logprobs: turn.logprobs
                   },
                   llm_call_id: call_id
                 )

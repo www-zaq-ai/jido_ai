@@ -394,6 +394,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
       thinking_trace: state[:thinking_trace],
       usage: state[:usage],
       output: state[:output],
+      logprobs: state[:last_logprobs],
       duration_ms: calculate_duration(state[:started_at]),
       tool_calls: format_tool_calls(state[:pending_tool_calls] || []),
       current_llm_call_id: state[:current_llm_call_id],
@@ -1561,6 +1562,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
         reasoning_details = event_field(data, :reasoning_details)
         tool_calls = event_field(data, :tool_calls, [])
         usage = event_field(data, :usage, %{})
+        logprobs = event_field(data, :logprobs)
         call_id = llm_call_id || event_field(data, :call_id, "")
 
         pending_tool_calls =
@@ -1592,6 +1594,7 @@ defmodule Jido.AI.Reasoning.ReAct.Strategy do
           end)
           |> maybe_append_thinking_trace(thinking_content)
           |> maybe_put_result(turn_type, text)
+          |> then(fn s -> if logprobs, do: Map.put(s, :last_logprobs, logprobs), else: s end)
 
         llm_signal =
           Signal.LLMResponse.new!(%{
