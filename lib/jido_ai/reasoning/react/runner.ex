@@ -7,6 +7,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   """
 
   alias Jido.AI.PendingInputServer
+  alias Jido.AI.Output
   alias Jido.AI.Reasoning.ReAct.{Config, Event, PendingToolCall, State, Token, ToolSelection}
   alias Jido.AI.Effects
   alias Jido.AI.Context, as: AIContext
@@ -169,19 +170,15 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       state.iteration > config.max_iterations ->
         seal_pending_input_server(config)
 
-        state
-        |> State.put_status(:completed)
-        |> State.put_result("Maximum iterations reached without a final answer.")
-        |> then(fn completed ->
-          {completed, _} =
-            emit_event(completed, owner, ref, :request_completed, %{
-              result: completed.result,
-              termination_reason: :max_iterations,
-              usage: completed.usage
-            })
+        completed =
+          state
+          |> State.put_status(:completed)
+          |> State.put_result("Maximum iterations reached without a final answer.")
 
-          completed
-        end)
+        case complete_run(completed, owner, ref, config, :max_iterations) do
+          {:ok, completed} -> completed
+          {:error, failed_state, reason, error_type} -> fail_run(failed_state, owner, ref, config, reason, error_type)
+        end
 
       true ->
         case drain_pending_input(state, owner, ref, config) do
@@ -235,7 +232,11 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     check_cancel!(state, ref)
 
     call_id = "call_#{state.run_id}_#{state.iteration}_#{Jido.Util.generate_id()}"
-    state = State.put_llm_call_id(state, call_id)
+
+    state =
+      state
+      |> State.clear_streaming()
+      |> State.put_llm_call_id(call_id)
 
     {state, _} =
       emit_event(
@@ -335,6 +336,7 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     }
 
     with {:ok, request} <- maybe_transform_request(base_request, state, config, runtime_context),
+         request <- maybe_apply_output_instructions(request, config.output),
          {:ok, messages} <- normalize_request_messages(request),
          {:ok, tools} <- normalize_request_tools(request),
          llm_opts <- sync_tools_in_llm_opts(config, request.llm_opts, tools) do
@@ -379,6 +381,12 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
       Config.merge_llm_opts(config, base_opts, llm_opts_override)
     end)
   end
+
+  defp maybe_apply_output_instructions(%{messages: messages} = request, %Output{} = output) when is_list(messages) do
+    %{request | messages: Output.apply_instructions(messages, output)}
+  end
+
+  defp maybe_apply_output_instructions(request, _output), do: request
 
   defp normalize_request_messages(%{messages: messages}) when is_list(messages), do: {:ok, messages}
   defp normalize_request_messages(_request), do: {:error, :invalid_request_messages}
@@ -450,8 +458,14 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
            stream_process_opts(owner, ref, trace_cfg, state_key, heartbeat_interval_ms)
          ) do
       {:ok, response} ->
-        {:ok, current_stream_state(state_key, state),
-         Turn.from_response(response, model: Jido.AI.model_label(config.model)), extract_response_id(response)}
+        current_state = current_stream_state(state_key, state)
+
+        turn =
+          response
+          |> Turn.from_response(model: Jido.AI.model_label(config.model))
+          |> apply_stream_accumulator(current_state)
+
+        {:ok, current_state, turn, extract_response_id(response)}
 
       {:error, reason} ->
         {:error, current_stream_state(state_key, state), reason}
@@ -796,6 +810,117 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
     state
   end
 
+  defp complete_run(%State{} = state, owner, ref, %Config{} = config, termination_reason) do
+    with {:ok, state} <- finalize_output(state, owner, ref, config) do
+      {state, _} =
+        emit_event(state, owner, ref, :request_completed, %{
+          result: state.result,
+          termination_reason: termination_reason,
+          usage: state.usage,
+          output: state.output
+        })
+
+      {:ok, state}
+    end
+  end
+
+  defp finalize_output(%State{} = state, _owner, _ref, %Config{output: nil}), do: {:ok, state}
+
+  defp finalize_output(%State{} = state, owner, ref, %Config{output: %Output{} = output} = config) do
+    context = output_context(state, config)
+    {state, _} = emit_output_event(state, owner, ref, :output_started, output, :started, state.result, attempt: 0)
+
+    case Output.parse(output, state.result) do
+      {:ok, parsed} ->
+        meta = Output.meta(output, :validated, state.result, attempt: 0)
+
+        {state, _} =
+          emit_output_event(state, owner, ref, :output_validated, output, :validated, parsed, attempt: 0)
+
+        {:ok, state |> State.put_result(parsed) |> State.put_output(meta)}
+
+      {:error, reason} ->
+        repair_or_fail_output(state, owner, ref, output, context, state.result, reason, 1)
+    end
+  end
+
+  defp repair_or_fail_output(
+         state,
+         owner,
+         ref,
+         %Output{on_validation_error: :repair, retries: retries} = output,
+         context,
+         raw,
+         reason,
+         attempt
+       )
+       when attempt <= retries do
+    {state, _} =
+      emit_output_event(state, owner, ref, :output_repair, output, :repair, raw,
+        attempt: attempt,
+        validation_error: reason
+      )
+
+    case Output.repair(output, raw, reason, context) do
+      {:ok, parsed} ->
+        meta = Output.meta(output, :repaired, raw, attempt: attempt, validation_error: reason)
+
+        {state, _} =
+          emit_output_event(state, owner, ref, :output_validated, output, :validated, parsed, attempt: attempt)
+
+        {:ok, state |> State.put_result(parsed) |> State.put_output(meta)}
+
+      {:error, repair_reason} ->
+        repair_or_fail_output(state, owner, ref, output, context, raw, repair_reason, attempt + 1)
+    end
+  end
+
+  defp repair_or_fail_output(state, owner, ref, %Output{} = output, _context, raw, reason, attempt) do
+    meta = Output.meta(output, :error, raw, attempt: max(attempt - 1, 0), error: reason)
+
+    {state, _} =
+      emit_output_event(state, owner, ref, :output_failed, output, :error, raw,
+        attempt: max(attempt - 1, 0),
+        error: reason
+      )
+
+    {:error, State.put_output(state, meta), reason, :output_validation}
+  end
+
+  defp emit_output_event(%State{} = state, owner, ref, kind, %Output{} = output, status, raw, opts) do
+    data =
+      output
+      |> Output.meta(status, raw, opts)
+      |> Map.put(:schema_summary, output_schema_summary(output))
+
+    emit_event(state, owner, ref, kind, data)
+  end
+
+  defp output_context(%State{} = state, %Config{} = config) do
+    %{
+      model: config.model,
+      llm_opts: Config.llm_opts(config),
+      user_message: latest_query(state),
+      request_id: state.request_id,
+      run_id: state.run_id
+    }
+  end
+
+  defp output_schema_summary(%Output{} = output) do
+    schema = Output.json_schema(output)
+
+    %{
+      schema_kind: output.schema_kind,
+      required: Map.get(schema, "required", Map.get(schema, :required, [])),
+      properties:
+        schema
+        |> Map.get("properties", Map.get(schema, :properties, %{}))
+        |> Map.keys()
+    }
+  rescue
+    _ -> %{schema_kind: output.schema_kind}
+  end
+
   defp emit_checkpoint(%State{} = state, owner, ref, %Config{} = config, reason)
        when reason in [:after_llm, :after_tools, :terminal] do
     token = Token.issue(state, config)
@@ -937,6 +1062,28 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp maybe_put_assistant_context_opt(opts, _key, nil), do: opts
   defp maybe_put_assistant_context_opt(opts, key, value), do: Keyword.put(opts, key, value)
 
+  defp apply_stream_accumulator(%Turn{} = turn, %State{} = state) do
+    turn
+    |> maybe_put_accumulated_text(state.streaming_text)
+    |> maybe_put_accumulated_thinking(state.streaming_thinking)
+  end
+
+  defp apply_stream_accumulator(%Turn{} = turn, _state), do: turn
+
+  defp maybe_put_accumulated_text(%Turn{type: :final_answer, text: text} = turn, accumulated)
+       when text in [nil, ""] and is_binary(accumulated) and accumulated != "" do
+    %{turn | text: accumulated}
+  end
+
+  defp maybe_put_accumulated_text(turn, _accumulated), do: turn
+
+  defp maybe_put_accumulated_thinking(%Turn{thinking_content: thinking} = turn, accumulated)
+       when thinking in [nil, ""] and is_binary(accumulated) and accumulated != "" do
+    %{turn | thinking_content: accumulated}
+  end
+
+  defp maybe_put_accumulated_thinking(turn, _accumulated), do: turn
+
   defp maybe_note_owner_signal(true, _owner, _ref, _last_owner_signal_ms, _interval_ms), do: monotonic_ms()
 
   defp maybe_note_owner_signal(false, owner, ref, last_owner_signal_ms, interval_ms) do
@@ -989,6 +1136,8 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
   defp emit_stream_delta(state_key, owner, ref, chunk_type, text) do
     update_stream_state(state_key, fn
       %State{} = current_state ->
+        current_state = append_stream_delta(current_state, chunk_type, text)
+
         {next_state, _} =
           emit_event(current_state, owner, ref, :llm_delta, %{chunk_type: chunk_type, delta: text})
 
@@ -1000,6 +1149,16 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
 
     :ok
   end
+
+  defp append_stream_delta(%State{} = state, :content, text) when is_binary(text) do
+    %{state | streaming_text: state.streaming_text <> text, updated_at_ms: now_ms()}
+  end
+
+  defp append_stream_delta(%State{} = state, :thinking, text) when is_binary(text) do
+    %{state | streaming_thinking: state.streaming_thinking <> text, updated_at_ms: now_ms()}
+  end
+
+  defp append_stream_delta(%State{} = state, _chunk_type, _text), do: state
 
   defp stream_state_key(ref), do: {__MODULE__, :stream_state, ref}
   defp stream_signal_key(ref), do: {__MODULE__, :stream_signal, ref}
@@ -1069,14 +1228,10 @@ defmodule Jido.AI.Reasoning.ReAct.Runner do
         end
 
       :sealed ->
-        {state, _} =
-          emit_event(state, owner, ref, :request_completed, %{
-            result: state.result,
-            termination_reason: :final_answer,
-            usage: state.usage
-          })
-
-        {:complete, state}
+        case complete_run(state, owner, ref, config, :final_answer) do
+          {:ok, state} -> {:complete, state}
+          {:error, state, reason, error_type} -> {:error, state, reason, error_type}
+        end
 
       {:error, reason} ->
         {:error, state, {:pending_input_server, reason}, :runtime}
