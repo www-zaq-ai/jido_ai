@@ -25,7 +25,7 @@ defmodule Jido.AI.Signal.Helpers do
     %{
       type: type,
       message: message,
-      details: details,
+      details: normalize_json_safe_map(details),
       retryable?: retryable?
     }
   end
@@ -225,7 +225,42 @@ defmodule Jido.AI.Signal.Helpers do
 
   defp merge_error_details(details, extra_details) when is_map(details) and is_map(extra_details) do
     Map.merge(details, extra_details)
+    |> normalize_json_safe_map()
   end
+
+  defp normalize_json_safe_map(map) when is_map(map) do
+    Map.new(map, fn {key, value} ->
+      {normalize_json_safe_key(key), normalize_json_safe_value(value)}
+    end)
+  end
+
+  defp normalize_json_safe_key(key) when is_binary(key), do: key
+  defp normalize_json_safe_key(key) when is_atom(key), do: key
+  defp normalize_json_safe_key(key), do: inspect(key)
+
+  defp normalize_json_safe_value(value) when is_nil(value), do: nil
+  defp normalize_json_safe_value(value) when is_boolean(value), do: value
+  defp normalize_json_safe_value(value) when is_integer(value), do: value
+  defp normalize_json_safe_value(value) when is_float(value), do: value
+  defp normalize_json_safe_value(value) when is_binary(value), do: value
+
+  defp normalize_json_safe_value(value) when is_atom(value), do: value
+
+  defp normalize_json_safe_value(value) when is_list(value) do
+    Enum.map(value, &normalize_json_safe_value/1)
+  end
+
+  defp normalize_json_safe_value(%_{} = struct) do
+    struct
+    |> Map.from_struct()
+    |> normalize_json_safe_map()
+  end
+
+  defp normalize_json_safe_value(value) when is_map(value) do
+    normalize_json_safe_map(value)
+  end
+
+  defp normalize_json_safe_value(value), do: inspect(value)
 
   defp normalize_retryable(error, type) do
     cond do
