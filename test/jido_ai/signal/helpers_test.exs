@@ -48,6 +48,42 @@ defmodule Jido.AI.Signal.HelpersTest do
                retryable?: false
              }
     end
+
+    test "normalizes details into JSON-safe values" do
+      envelope =
+        Helpers.normalize_error(%{
+          type: :execution_error,
+          message: "boom",
+          details: %{
+            pid: self(),
+            ref: make_ref(),
+            tuple: {:error, :bad},
+            nested: %{inner: {:ok, :value}}
+          }
+        })
+
+      assert is_binary(envelope.details.pid)
+      assert is_binary(envelope.details.ref)
+      assert is_binary(envelope.details.tuple)
+      assert is_binary(envelope.details.nested.inner)
+      assert Jason.encode!(envelope)
+    end
+
+    test "error_envelope/4 sanitizes direct details payloads" do
+      envelope =
+        Helpers.error_envelope(:execution_error, "boom", %{
+          pid: self(),
+          ref: make_ref(),
+          tuple: {:error, :bad},
+          map_key: %{1 => :one}
+        })
+
+      assert is_binary(envelope.details.pid)
+      assert is_binary(envelope.details.ref)
+      assert is_binary(envelope.details.tuple)
+      assert envelope.details.map_key["1"] == :one
+      assert Jason.encode!(envelope)
+    end
   end
 
   describe "correlation_id/1" do

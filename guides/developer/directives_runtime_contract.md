@@ -46,6 +46,9 @@ Runtime-emitted failures for `ai.llm.response` and `ai.tool.result` normalize to
 Legacy error shapes may still enter at boundaries, but runtime helpers normalize
 them before the signal leaves the runtime layer.
 
+`details` is sanitized to JSON-safe values at this boundary so tuple/pid/ref terms
+cannot break downstream envelope encoding.
+
 ## Tool Result Content Contract
 
 For model follow-up turns, the canonical tool result semantics should be

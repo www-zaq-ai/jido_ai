@@ -32,6 +32,10 @@ Upstream packages such as `jido_action` should stay generic. They can expose
 error type/message/details and retryability, but they should not define
 AI-specific contracts.
 
+At this boundary, envelope `details` are normalized to JSON-safe values. Raw
+runtime terms (for example tuples, pids, refs) are stringified so signal and
+telemetry payload encoding stays reliable.
+
 ## Example: Sanitized User Message + Full Log
 
 ```elixir
