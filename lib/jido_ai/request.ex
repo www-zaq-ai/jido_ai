@@ -287,11 +287,11 @@ defmodule Jido.AI.Request do
   def await(%Handle{id: request_id, server: server}, opts \\ []) do
     timeout = Keyword.get(opts, :timeout, @default_timeout)
 
-    # Use AgentServer's await_completion with request-specific paths
+    # Fetch the full request map so normalize_await_result can access :meta (logprobs, usage, etc.)
     Jido.AgentServer.await_completion(server,
       timeout: timeout,
       status_path: [:requests, request_id, :status],
-      result_path: [:requests, request_id, :result],
+      result_path: [:requests, request_id],
       error_path: [:requests, request_id, :error]
     )
     |> normalize_await_result()
@@ -620,6 +620,7 @@ defmodule Jido.AI.Request do
     |> maybe_put_meta(:reasoning_details, extract_snapshot_reasoning_details(details, snapshot))
     |> maybe_put_meta(:thinking_trace, normalize_non_empty_list(get_field(details, :thinking_trace)))
     |> maybe_put_meta(:last_thinking, extract_snapshot_last_thinking(details, snapshot))
+    |> maybe_put_meta(:logprobs, normalize_non_empty_list(get_field(details, :logprobs)))
   end
 
   defp snapshot_request_meta(_), do: %{}
@@ -694,6 +695,32 @@ defmodule Jido.AI.Request do
 
   defp get_field(map, key, default) when is_atom(key) do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+  end
+
+  # result_path points to the full request map — only wrap when logprobs are present
+  defp normalize_await_result({:ok, %{status: :completed, result: %{status: :completed, result: result, meta: meta}}})
+       when is_map(meta) do
+    case Map.get(meta, :logprobs) do
+      logprobs when is_list(logprobs) and logprobs != [] ->
+        {:ok, Map.put(meta, :result, result)}
+
+      _ ->
+        {:ok, result}
+    end
+  end
+
+  defp normalize_await_result({:ok, %{status: :completed, result: %{status: :completed, result: result}}}) do
+    {:ok, result}
+  end
+
+  defp normalize_await_result({:ok, %{status: :completed, result: %{status: :failed, error: error}}}) do
+    {:error, error || :failed}
+  end
+
+  # Legacy / fallback: result is the raw value (not a request map)
+  defp normalize_await_result({:ok, %{status: :completed, result: result, meta: meta}})
+       when is_map(meta) and map_size(meta) > 0 do
+    {:ok, Map.put(meta, :result, result)}
   end
 
   defp normalize_await_result({:ok, %{status: :completed, result: result}}) do

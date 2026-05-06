@@ -463,6 +463,63 @@ defmodule JidoTest.AI.RequestTest do
       assert {:error, {:rejected, :busy, "Agent is busy"}} = Request.await(handle, timeout: 100)
     end
 
+    test "await/2 returns map with logprobs when full request map has non-empty logprobs in meta" do
+      logprobs = [%{"token" => "A1", "logprob" => -0.1}]
+
+      request_map = %{
+        status: :completed,
+        result: "A1",
+        meta: %{logprobs: logprobs, usage: %{prompt_tokens: 10}}
+      }
+
+      server =
+        start_runtime_server(await_result: {:ok, %{status: :completed, result: request_map}})
+
+      handle = Handle.new("req_logprobs", server, "query")
+
+      assert {:ok, result} = Request.await(handle, timeout: 100)
+      assert result.result == "A1"
+      assert result.logprobs == logprobs
+    end
+
+    test "await/2 returns plain result when full request map meta has no logprobs" do
+      request_map = %{
+        status: :completed,
+        result: "A1",
+        meta: %{usage: %{prompt_tokens: 10}}
+      }
+
+      server =
+        start_runtime_server(await_result: {:ok, %{status: :completed, result: request_map}})
+
+      handle = Handle.new("req_no_logprobs", server, "query")
+      assert {:ok, "A1"} = Request.await(handle, timeout: 100)
+    end
+
+    test "await/2 returns plain result when full request map meta has empty logprobs list" do
+      request_map = %{
+        status: :completed,
+        result: "A1",
+        meta: %{logprobs: [], usage: %{prompt_tokens: 10}}
+      }
+
+      server =
+        start_runtime_server(await_result: {:ok, %{status: :completed, result: request_map}})
+
+      handle = Handle.new("req_empty_logprobs", server, "query")
+      assert {:ok, "A1"} = Request.await(handle, timeout: 100)
+    end
+
+    test "await/2 returns error when full request map indicates failure" do
+      request_map = %{status: :failed, error: :inference_error}
+
+      server =
+        start_runtime_server(await_result: {:ok, %{status: :completed, result: request_map}})
+
+      handle = Handle.new("req_inner_fail", server, "query")
+      assert {:error, :inference_error} = Request.await(handle, timeout: 100)
+    end
+
     test "await/2 normalizes AgentServer timeout diagnostics to :timeout" do
       server =
         start_runtime_server(await_result: {:ok, %{status: :completed, result: "too late"}}, await_delay_ms: 50)
